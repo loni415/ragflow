@@ -1,2 +1,4 @@
 *.sh text eol=lf
 docker/entrypoint.sh text eol=lf executable
+tika-server-standard-3.0.0.jar filter=lfs diff=lfs merge=lfs -text
+chrome-linux64-121-0-6167-85 filter=lfs diff=lfs merge=lfs -text
