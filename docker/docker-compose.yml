@@ -7,6 +7,10 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+      redis: # <--- ADD THIS DEPENDENCY
+        condition: service_healthy # <--- WAITS FOR REDIS TO BE HEALTHY
+      es01:
+        condition: service_healthy
     image: ${RAGFLOW_IMAGE}
     # Example configuration to set up an MCP server:
     # command:
@@ -19,7 +23,7 @@ services:
     #   - --mcp-host-api-key=ragflow-xxxxxxx
     container_name: ragflow-server
     ports:
-      - ${SVR_HTTP_PORT}:9380
+      - "${SVR_HTTP_PORT:-9380}:9380"
       - 80:80
       - 443:443
       - 5678:5678
