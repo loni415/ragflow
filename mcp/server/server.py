@@ -17,12 +17,13 @@
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from functools import wraps
 
+import click
 import requests
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 from strenum import StrEnum
 
@@ -127,22 +128,45 @@ app = Server("ragflow-server", lifespan=server_lifespan)
 sse = SseServerTransport("/messages/")
 
 
+def with_api_key(required=True):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            ctx = app.request_context
+            ragflow_ctx = ctx.lifespan_context.get("ragflow_ctx")
+            if not ragflow_ctx:
+                raise ValueError("Get RAGFlow Context failed")
+
+            connector = ragflow_ctx.conn
+
+            if MODE == LaunchMode.HOST:
+                headers = ctx.session._init_options.capabilities.experimental.get("headers", {})
+                token = None
+
+                # lower case here, because of Starlette conversion
+                auth = headers.get("authorization", "")
+                if auth.startswith("Bearer "):
+                    token = auth.removeprefix("Bearer ").strip()
+                elif "api_key" in headers:
+                    token = headers["api_key"]
+
+                if required and not token:
+                    raise ValueError("RAGFlow API key or Bearer token is required.")
+
+                connector.bind_api_key(token)
+            else:
+                connector.bind_api_key(HOST_API_KEY)
+
+            return await func(*args, connector=connector, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 @app.list_tools()
-async def list_tools() -> list[types.Tool]:
-    ctx = app.request_context
-    ragflow_ctx = ctx.lifespan_context["ragflow_ctx"]
-    if not ragflow_ctx:
-        raise ValueError("Get RAGFlow Context failed")
-    connector = ragflow_ctx.conn
-
-    if MODE == LaunchMode.HOST:
-        api_key = ctx.session._init_options.capabilities.experimental["headers"]["api_key"]
-        if not api_key:
-            raise ValueError("RAGFlow API_KEY is required.")
-    else:
-        api_key = HOST_API_KEY
-    connector.bind_api_key(api_key)
-
+@with_api_key(required=True)
+async def list_tools(*, connector) -> list[types.Tool]:
     dataset_description = connector.list_datasets()
 
     return [
@@ -152,7 +176,17 @@ async def list_tools() -> list[types.Tool]:
             + dataset_description,
             inputSchema={
                 "type": "object",
-                "properties": {"dataset_ids": {"type": "array", "items": {"type": "string"}}, "document_ids": {"type": "array", "items": {"type": "string"}}, "question": {"type": "string"}},
+                "properties": {
+                    "dataset_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "document_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "question": {"type": "string"},
+                },
                 "required": ["dataset_ids", "question"],
             },
         ),
@@ -160,65 +194,79 @@ async def list_tools() -> list[types.Tool]:
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-    ctx = app.request_context
-    ragflow_ctx = ctx.lifespan_context["ragflow_ctx"]
-    if not ragflow_ctx:
-        raise ValueError("Get RAGFlow Context failed")
-    connector = ragflow_ctx.conn
-
-    if MODE == LaunchMode.HOST:
-        api_key = ctx.session._init_options.capabilities.experimental["headers"]["api_key"]
-        if not api_key:
-            raise ValueError("RAGFlow API_KEY is required.")
-    else:
-        api_key = HOST_API_KEY
-    connector.bind_api_key(api_key)
-
+@with_api_key(required=True)
+async def call_tool(name: str, arguments: dict, *, connector) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
     if name == "ragflow_retrieval":
         document_ids = arguments.get("document_ids", [])
-        return connector.retrieval(dataset_ids=arguments["dataset_ids"], document_ids=document_ids, question=arguments["question"])
+        return connector.retrieval(
+            dataset_ids=arguments["dataset_ids"],
+            document_ids=document_ids,
+            question=arguments["question"],
+        )
     raise ValueError(f"Tool not found: {name}")
 
 
 async def handle_sse(request):
     async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
         await app.run(streams[0], streams[1], app.create_initialization_options(experimental_capabilities={"headers": dict(request.headers)}))
+    return Response()
 
 
-class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        if request.url.path.startswith("/sse") or request.url.path.startswith("/messages"):
-            api_key = request.headers.get("api_key")
-            if not api_key:
-                return JSONResponse({"error": "Missing unauthorization header"}, status_code=401)
-        return await call_next(request)
+def create_starlette_app():
+    middleware = None
+    if MODE == LaunchMode.HOST:
+        from starlette.types import ASGIApp, Receive, Scope, Send
+
+        class AuthMiddleware:
+            def __init__(self, app: ASGIApp):
+                self.app = app
+
+            async def __call__(self, scope: Scope, receive: Receive, send: Send):
+                if scope["type"] != "http":
+                    await self.app(scope, receive, send)
+                    return
+
+                path = scope["path"]
+                if path.startswith("/messages/") or path.startswith("/sse"):
+                    headers = dict(scope["headers"])
+                    token = None
+                    auth_header = headers.get(b"authorization")
+                    if auth_header and auth_header.startswith(b"Bearer "):
+                        token = auth_header.removeprefix(b"Bearer ").strip()
+                    elif b"api_key" in headers:
+                        token = headers[b"api_key"]
+
+                    if not token:
+                        response = JSONResponse({"error": "Missing or invalid authorization header"}, status_code=401)
+                        await response(scope, receive, send)
+                        return
+
+                await self.app(scope, receive, send)
+
+        middleware = [Middleware(AuthMiddleware)]
+
+    return Starlette(
+        debug=True,
+        routes=[
+            Route("/sse", endpoint=handle_sse, methods=["GET"]),
+            Mount("/messages/", app=sse.handle_post_message),
+        ],
+        middleware=middleware,
+    )
 
 
-middleware = None
-if MODE == LaunchMode.HOST:
-    middleware = [Middleware(AuthMiddleware)]
-
-starlette_app = Starlette(
-    debug=True,
-    routes=[
-        Route("/sse", endpoint=handle_sse),
-        Mount("/messages/", app=sse.handle_post_message),
-    ],
-    middleware=middleware,
+@click.command()
+@click.option("--base-url", type=str, default="http://127.0.0.1:9380", help="API base URL for RAGFlow backend")
+@click.option("--host", type=str, default="127.0.0.1", help="Host to bind the RAGFlow MCP server")
+@click.option("--port", type=int, default=9382, help="Port to bind the RAGFlow MCP server")
+@click.option(
+    "--mode",
+    type=click.Choice(["self-host", "host"]),
+    default="self-host",
+    help=("Launch mode:\n  self-host: run MCP for a single tenant (requires --api-key)\n  host: multi-tenant mode, users must provide Authorization headers"),
 )
-
-
-if __name__ == "__main__":
-    """
-    Launch example:
-        self-host:
-            uv run mcp/server/server.py --host=127.0.0.1 --port=9382 --base_url=http://127.0.0.1:9380 --mode=self-host --api_key=ragflow-xxxxx
-        host:
-            uv run mcp/server/server.py --host=127.0.0.1 --port=9382 --base_url=http://127.0.0.1:9380 --mode=host
-    """
-
-    import argparse
+@click.option("--api-key", type=str, default="", help="API key to use when in self-host mode")
+def main(base_url, host, port, mode, api_key):
     import os
 
     import uvicorn
@@ -226,31 +274,15 @@ if __name__ == "__main__":
 
     load_dotenv()
 
-    parser = argparse.ArgumentParser(description="RAGFlow MCP Server")
-    parser.add_argument("--base_url", type=str, default="http://127.0.0.1:9380", help="api_url: http://<host_address>")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="RAGFlow MCP SERVER host")
-    parser.add_argument("--port", type=str, default="9382", help="RAGFlow MCP SERVER port")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="self-host",
-        help="Launch mode options:\n"
-        "  * self-host: Launches an MCP server to access a specific tenant space. The 'api_key' argument is required.\n"
-        "  * host: Launches an MCP server that allows users to access their own spaces. Each request must include a header "
-        "indicating the user's identification.",
-    )
-    parser.add_argument("--api_key", type=str, default="", help="RAGFlow MCP SERVER HOST API KEY")
-    args = parser.parse_args()
-    if args.mode not in ["self-host", "host"]:
-        parser.error("--mode is only accept 'self-host' or 'host'")
-    if args.mode == "self-host" and not args.api_key:
-        parser.error("--api_key is required when --mode is 'self-host'")
+    global BASE_URL, HOST, PORT, MODE, HOST_API_KEY
+    BASE_URL = os.environ.get("RAGFLOW_MCP_BASE_URL", base_url)
+    HOST = os.environ.get("RAGFLOW_MCP_HOST", host)
+    PORT = os.environ.get("RAGFLOW_MCP_PORT", str(port))
+    MODE = os.environ.get("RAGFLOW_MCP_LAUNCH_MODE", mode)
+    HOST_API_KEY = os.environ.get("RAGFLOW_MCP_HOST_API_KEY", api_key)
 
-    BASE_URL = os.environ.get("RAGFLOW_MCP_BASE_URL", args.base_url)
-    HOST = os.environ.get("RAGFLOW_MCP_HOST", args.host)
-    PORT = os.environ.get("RAGFLOW_MCP_PORT", args.port)
-    MODE = os.environ.get("RAGFLOW_MCP_LAUNCH_MODE", args.mode)
-    HOST_API_KEY = os.environ.get("RAGFLOW_MCP_HOST_API_KEY", args.api_key)
+    if MODE == "self-host" and not HOST_API_KEY:
+        raise click.UsageError("--api-key is required when --mode is 'self-host'")
 
     print(
         r"""
@@ -259,7 +291,7 @@ __  __  ____ ____       ____  _____ ______     _______ ____
 | |\/| | |   | |_) |    \___ \|  _| | |_) \ \ / /|  _| | |_) |
 | |  | | |___|  __/      ___) | |___|  _ < \ V / | |___|  _ <
 |_|  |_|\____|_|        |____/|_____|_| \_\ \_/  |_____|_| \_\
-    """,
+        """,
         flush=True,
     )
     print(f"MCP launch mode: {MODE}", flush=True)
@@ -268,7 +300,18 @@ __  __  ____ ____       ____  _____ ______     _______ ____
     print(f"MCP base_url: {BASE_URL}", flush=True)
 
     uvicorn.run(
-        starlette_app,
+        create_starlette_app(),
         host=HOST,
         port=int(PORT),
     )
+
+
+if __name__ == "__main__":
+    """
+    Launch example:
+        self-host:
+            uv run mcp/server/server.py --host=127.0.0.1 --port=9382 --base-url=http://127.0.0.1:9380 --mode=self-host --api-key=ragflow-xxxxx
+        host:
+            uv run mcp/server/server.py --host=127.0.0.1 --port=9382 --base-url=http://127.0.0.1:9380 --mode=host
+    """
+    main()
